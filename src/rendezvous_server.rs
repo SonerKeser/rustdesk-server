@@ -345,6 +345,10 @@ impl RendezvousServer {
                     }
                     let id = rk.id;
                     let ip = addr.ip().to_string();
+                    if !panel_ip_allowed(&ip) {
+                        panel_log_violation(&ip, &id, "register");
+                        return Ok(());
+                    }
                     if id.len() < 6 {
                         return send_rk_res(socket, addr, UUID_MISMATCH).await;
                     } else if !self.check_ip_blocker(&ip, &id).await {
@@ -689,6 +693,15 @@ impl RendezvousServer {
         let mut ph = ph;
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
+        if !panel_ip_allowed(&addr.ip().to_string()) {
+            panel_log_violation(&addr.ip().to_string(), &ph.id, "connect");
             let mut msg_out = RendezvousMessage::new();
             msg_out.set_punch_hole_response(PunchHoleResponse {
                 failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
@@ -1368,4 +1381,134 @@ async fn create_tcp_listener(port: i32) -> ResultType<TcpListener> {
     let s = listen_any(port as _).await?;
     log::debug!("listen on tcp {:?}", s.local_addr());
     Ok(s)
+}
+
+
+// ====== Panel IP erisim kontrolu (whitelist/blacklist) — eklenti ======
+#[derive(Default, Clone)]
+struct PanelIpAcl {
+    enabled: bool,
+    enforce_whitelist: bool,
+    whitelist: Vec<String>,
+    blacklist: Vec<String>,
+}
+
+static PANEL_IP_ACL: once_cell::sync::Lazy<
+    std::sync::RwLock<(Option<PanelIpAcl>, Option<std::time::Instant>)>,
+> = once_cell::sync::Lazy::new(|| std::sync::RwLock::new((None, None)));
+
+fn panel_ip_to_u32(s: &str) -> Option<u32> {
+    let o: Vec<&str> = s.split('.').collect();
+    if o.len() != 4 {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for p in o {
+        let v: u32 = p.parse().ok()?;
+        if v > 255 {
+            return None;
+        }
+        n = (n << 8) | v;
+    }
+    Some(n)
+}
+
+fn panel_cidr_match(ip: &str, cidr: &str) -> bool {
+    let parts: Vec<&str> = cidr.split('/').collect();
+    if parts.len() != 2 {
+        return false;
+    }
+    let bits: u32 = match parts[1].parse() {
+        Ok(b) if b <= 32 => b,
+        _ => return false,
+    };
+    match (panel_ip_to_u32(ip), panel_ip_to_u32(parts[0])) {
+        (Some(a), Some(b)) => {
+            let mask = if bits == 0 { 0 } else { (!0u32) << (32 - bits) };
+            (a & mask) == (b & mask)
+        }
+        _ => false,
+    }
+}
+
+fn panel_ip_in_list(ip: &str, list: &[String]) -> bool {
+    for r in list {
+        if r.contains('/') {
+            if panel_cidr_match(ip, r) {
+                return true;
+            }
+        } else if r == ip {
+            return true;
+        }
+    }
+    false
+}
+
+fn panel_load_acl() -> Option<PanelIpAcl> {
+    let path = std::env::var("IP_RULES_FILE").ok()?;
+    if path.is_empty() {
+        return None;
+    }
+    let data = std::fs::read_to_string(&path).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&data).ok()?;
+    let arr = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|x| x.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|e| e.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    Some(PanelIpAcl {
+        enabled: v.get("enabled").and_then(|x| x.as_bool()).unwrap_or(false),
+        enforce_whitelist: v
+            .get("enforceWhitelist")
+            .and_then(|x| x.as_bool())
+            .unwrap_or(true),
+        whitelist: arr("whitelist"),
+        blacklist: arr("blacklist"),
+    })
+}
+
+fn panel_get_acl() -> Option<PanelIpAcl> {
+    {
+        let g = PANEL_IP_ACL.read().unwrap();
+        if let Some(t) = g.1 {
+            if t.elapsed().as_secs() < 15 {
+                return g.0.clone();
+            }
+        }
+    }
+    let acl = panel_load_acl();
+    let mut g = PANEL_IP_ACL.write().unwrap();
+    *g = (acl.clone(), Some(std::time::Instant::now()));
+    acl
+}
+
+// true = izin. ACL yok / enabled=false -> daima izin (stok davranis, guvenli varsayilan).
+fn panel_ip_allowed(ip: &str) -> bool {
+    let acl = match panel_get_acl() {
+        Some(a) if a.enabled => a,
+        _ => return true,
+    };
+    if panel_ip_in_list(ip, &acl.blacklist) {
+        return false;
+    }
+    if acl.enforce_whitelist && !panel_ip_in_list(ip, &acl.whitelist) {
+        return false;
+    }
+    true
+}
+
+fn panel_log_violation(ip: &str, id: &str, kind: &str) {
+    if let Ok(path) = std::env::var("IP_VIOLATIONS_FILE") {
+        if !path.is_empty() {
+            use std::io::Write;
+            if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+                let _ = writeln!(f, "{{\"ip\":\"{}\",\"id\":\"{}\",\"kind\":\"{}\"}}", ip, id, kind);
+            }
+        }
+    }
 }
