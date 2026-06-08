@@ -1,0 +1,52 @@
+name: Panel hbbs imaji (IP enforcement)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/**'
+      - 'libs/**'
+      - 'Cargo.toml'
+      - 'docker/panel.Dockerfile'
+      - '.github/workflows/panel-hbbs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: System deps
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build hbbs/hbbr
+        run: cargo build --release --bin hbbs --bin hbbr
+
+      - name: Stage image context
+        run: |
+          mkdir -p out
+          cp target/release/hbbs target/release/hbbr out/
+          cp docker/panel.Dockerfile out/Dockerfile
+
+      - name: GHCR login
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build & push
+        uses: docker/build-push-action@v6
+        with:
+          context: out
+          push: true
+          tags: ghcr.io/sonerkeser/rustdesk-server:latest
